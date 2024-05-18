@@ -1,6 +1,5 @@
 # Migrating from Vault Enterprise to OSS
 
-
 This guide is the result of a lot of work that came from learning the hard way that Vault Enterprise is not necessarily worth the large licensing and support costs that Hashicorp charges, and that with the proper team and configurations, it is quite easy to run reliable and effective Vault clusters. Unless an organization requires FIPS compliance, there is little that Vault Enterprise gives you that cannot be achieved with Vault OSS with a bit of dedication.
 
 The code snippets in this guide are from [https://github.com/nomeelnoj/terraform-aws-vault-cluster](https://github.com/nomeelnoj/terraform-aws-vault-cluster), a Terraform module that works for both Vault OSS and Vault Enterprise.
@@ -113,46 +112,27 @@ resource "vault_aws_auth_backend_role" "snapshotter" {
   backend                  = vault_auth_backend.aws.path
   role                     = "snapshotter"
   auth_type                = "iam"
-  bound_iam_principal_arns = [var.snapshotter_role_arn]
+  bound_iam_principal_arns = ["arn:aws:iam::0123456789:role/vault-cluster-dev"
   token_ttl                = 900
   token_max_ttl            = 900
   token_policies           = [vault_policy.snapshotter.name]
 }
 ```
 
-The above snippet assumes it is part of a module that includes the base config for any and all vault clusters that may be created. It requires a single `variable`, the ARN of the role that is assigned to the Vault nodes:
-
-```hcl
-# This is incomplete code
-module "vault_base_config" {
-  source               = "../../../../modules/vault/vault-base-config"
-  snapshotter_role_arn = "arn:aws:iam::0123456789:role/vault-cluster-dev"
-}
-```
-
 Once the Vault role itself is configured in Vault and bound to the IAM role on the Vault nodes, it can authenticate using the AWS auth method inside of a cronjob and take regular snapshots and upload them to S3.
 
-**NOTE: Since the Vault nodes in question are configured with Terraform and templated `user_data`, the syntax of the below code may look funny. Care has to be taken to escape the code properly. First it gets templated through Terraform and into the `user_data` script that runs at boot on any Vault node, creating a cronjob that needs to be valid bash syntax to effectively run. The code below is actually itself templated, and is therefore an argument into the `templatefile` terraform function to populate the `user_data`. Depending on how your user_data is written, you may need to modify the code below. It is highly recommended you test the rendering before migrating to OSS.**
-
-The files needed to template this into the `user_data` correctly are below. Note that `module.backups.bucket` is an S3 module output that represents the name of the S3 bucket we intend to use to store backups.
+The configs needed to template this into the `user_data` correctly are below. Note that `module.backups.bucket` is an S3 module output that represents the name of the S3 bucket we intend to use to store backups. This snippet creates `user_data` for the vault nodes to run at boot and is taken from the recommended [vault module](https://github.com/nomeelnoj/terraform-aws-vault-cluster/blob/main/locals.tf#L45-L69). _**If you are not using this module, your configuration will likely be different**_. The code has to be escaped properly as it is templated through Terraform's `templatefile`, then used in user data to create a cronjob that contains variables. It is highly recommended to test the rendering before migrating to OSS.
 
 ```hcl
 # locals.tf
 locals {
   userdata_values = {
     
-    region          = var.aws_region
-    tag_key         = var.tag_key
-    tag_value       = var.tag_value
-    leader_hostname = coalesce(var.leader_hostname, "vault.${var.env}.${local.hosted_zone}"
-
     # ... removed for brevity
 
-    snapshot_config = length(
-      regexall(
-        "vault-enterprise", var.vault_binary
-      )
-    ) > 0 ? "" : <<EOT
+    snapshot_config = strcontains(
+      var.vault_config["vault_version"], "ent"
+    ) ? "" : <<EOT
 cat <<-EOF > /etc/cron.daily/vault_snapshot
 #!/bin/bash
 
@@ -169,7 +149,7 @@ if [[ "\$${INSTANCE_ID}" == "\$${LEADER_ID}" ]]; then
   DATE=\$(date +%Y-%m-%d-%H-%M-%S)
   FILENAME="vault-snapshot-\$${DATE}Z.snap"
   vault operator raft snapshot save \$${FILENAME}
-  aws s3 cp "\$${FILENAME}" "s3://${module.backups.bucket}"
+  aws s3 cp "\$${FILENAME}" "s3://${aws_s3_bucket.default.bucket}"
   rm "\$${FILENAME}"
 fi
 EOF
@@ -179,7 +159,7 @@ EOT
 }
 ```
 
-This is passed into the `launch_template` as follows:
+This is passed into a `launch_template` as follows:
 
 ```hcl
 # launch_template.tf
@@ -200,74 +180,33 @@ resource "aws_launch_template" "default" {
 }
 ```
 
-It is written this way to support both enterprise and OSS deployments, so the above config is optional for the module. To round out the code example, below is a snippet of the `user_data.sh.tpl` file that will accept the templated input for `snapshot_config`:
+It is written this way to support both enterprise and OSS deployments, so the above config is optional for the module. For a full example of how it can be used in a functional vault module, make sure to checkout the full [`user_data.sh.tpl`](https://github.com/nomeelnoj/terraform-aws-vault-cluster/blob/main/templates/user_data.sh.tpl) file. The entire snapshot config can be easily passed as a single argument to `templatefile` as shown below. If the templated input is not going to be used with `templatefile`, the escapes will need to be modified.
 
 ```sh
-# templates/user_data.sh.tpl
-cat << EOF > /etc/vault.d/vault.hcl
-disable_performance_standby = true
-ui               = true
-disable_mlock    = true
-disable_sealwrap = true
-storage "raft" {
-  path    = "/opt/vault/data"
-  node_id = "$instance_id"
-  retry_join {
-    auto_join               = "provider=aws region=${region} tag_key=${tag_key} tag_value=${tag_value}"
-    auto_join_scheme        = "https"
-    leader_tls_servername   = "${leader_hostname}"
-    leader_ca_cert_file     = "/opt/vault/tls/vault-ca.pem"
-    leader_client_cert_file = "/opt/vault/tls/vault-cert.pem"
-    leader_client_key_file  = "/opt/vault/tls/vault-key.pem"
-  }
-}
-
-cluster_addr = "https://$local_ipv4:8201"
-api_addr     = "https://${leader_hostname}"
-
-listener "tcp" {
-  address                          = "0.0.0.0:8200"
-  tls_disable                      = false
-  tls_cert_file                    = "/opt/vault/tls/vault-cert.pem"
-  tls_key_file                     = "/opt/vault/tls/vault-key.pem"
-  tls_client_ca_file               = "/opt/vault/tls/vault-ca.pem"
-  x_forwarded_for_authorized_addrs = ${load_balancer_subnet_cidrs}
-}
-seal "awskms" {
-  region     = "${region}"
-  kms_key_id = "${kms_key_arn}"
-}
-telemetry {
-  prometheus_retention_time = "60s"
-  disable_hostname          = true
-}
-${vault_enterprise_license_config}
-EOF
-
 ${snapshot_config}
 ```
 
 ### Replacing the Enterprise Binary with OSS
 
-_**NOTE: Everything up to this point has been preparation. The following steps outline how to replace the Vault Enterprise binary with the OSS binary. Depending on the enterprise features leveraged, additional preparation is likely required before a migration to OSS is feasible. For example, if the cluster is leveraging namespaces, all secrets must first be moved to the default namespace.
+_**NOTE: Everything up to this point has been preparation. The following steps outline how to replace the Vault Enterprise binary with the OSS binary. Depending on the enterprise features leveraged, additional preparation is likely required before a migration to OSS is feasible. For example, if the cluster is leveraging namespaces, all secrets must first be moved to the default namespace.**_
 
 It is possible to downgrade from Enterprise to OSS, but has to be done very specifically. If you have not read the section above on [Enterprise Only features](#enterprise-only-featrures), please read it now.
 
-**NOTE: Please read all instructions carefully before taking any action. While this process incurs minimal downtime if done correctly, it should be completed rather quickly, as it essentially takes Vault down to a single node cluster without voters, so with a common voting quorum set to 3 or 5, leader election can fail during this time, causing outages.**
+**NOTE: Please read all instructions carefully before taking any action. While this process incurs minimal downtime if done correctly, it should be completed rather quickly, as it takes Vault down to a single node without voters, so with a common voting quorum set to 3 or 5, leader election can fail during this time, causing outages.**
 
 _**MAKE SURE TO TAKE A SNAPSHOT BEFORE STARTING!!!**_
 
 ```console
 # On the active / leader node
 vault login -method=ldap username=jsmith
-CURRENT_DATE=$(date +%Y-%m-%d-%H-%M-%S)
+CURRENT_DATE=$(date -u +%Y-%m-%d-%H-%M-%S)
 vault operator raft snapshot save > "pre_oss_migration_${CURRENT_DATE}Z.snap"
 aws s3 cp "pre_oss_migration_${CURRENT_DATE}Z.snap" s3://<backups-bucket>
 ```
 
 1. Log into AWS and suspend the processes on the autoscaling group so that nodes are not replaced when unhealthy or terminated (you can just suspend all the processes, like Terminate, Launch, Replace Unhealthy, etc.), essentially locking the ASG to the current nodes. We are going to be stopping and starting Vault, and it could fail health checks during this time, so we do not want nodes to be replaced while we are working on them.
-2. SSH into all 3 (or however many you deployed) Vault Enterprise nodes.
-3. Use `vault status` on each node to identify the standby nodes and active node.
+2. Log into all 3 (or however many you deployed) Vault Enterprise nodes.
+3. Use `vault status` on each node to familiarize yourself with "healthy" output and also identify the standby nodes and active node (you can also run `curl -s https://127.0.0.1:8200/v1/sys/leader | jq 'pick(.is_self, .leader_cluster_address)` to find the leader node)
 4. On all nodes, download the vault OSS binary using `wget` or `curl` from releases.hashicorp.com. **MAKE SURE TO MATCH THE OS ARCH AND RUNNING ENTERPRISE VERSION!!!**  Make sure you are using the `arm64` binary if running on Graviton!
 
         VERSION="1.15.4-1"
@@ -280,10 +219,15 @@ aws s3 cp "pre_oss_migration_${CURRENT_DATE}Z.snap" s3://<backups-bucket>
 
         unzip vault.zip
 
-6. On all servers, update the server config file (the linked terraform module defaults to `/etc/vault.d/vault.hcl`, though it may be different) and make sure to _**REMOVE**_ the `license_path` line from the file. Save and exit the file. This is safe to do with Vault still running because this file is loaded at runtime.
+6. On all servers, update the server config file (the linked terraform module defaults to `/etc/vault.d/vault.hcl`, though it may be different in your configuration) and make sure to _**REMOVE**_ the `license_path` line from the file. Save and exit the file. This is safe to do with Vault still running because this file is loaded at runtime.
+
+        sed -i '/license_path/d' /etc/vault.d/vault.hcl
+**_NOTE: If you do not remove the `license_path` line from the config file, Vault OSS will not start!!!_**
+
 7. **ON THE STANDBY NODES ONLY:**
     1. Stop vault with `systemctl stop vault`.
     2. This will leave you with a single node cluster, and as long as that node does not attempt a leader election during this time window, Vault should continue to function properly.
+
 8. **ON ALL NODES:**
     1. Replace the binary, making sure to confirm its location first, then make sure to set MLOCK.
 
@@ -300,23 +244,23 @@ aws s3 cp "pre_oss_migration_${CURRENT_DATE}Z.snap" s3://<backups-bucket>
             systemctl restart vault
             vault status
 
-10. After restarting vault on the active node, the `vault status` command should be run to confirm the version that is running and that Vault is unsealed and healthy. If it is not, continue to proceed, as Vault may require a leader election or quorum vote to return to a health status.
+10. After restarting vault on the active node, the `vault status` command should be run to confirm the version that is running and that Vault is unsealed and healthy. If it is not, continue to proceed, as Vault may require a leader election or quorum vote to return to a healthy status.
 11. **ON THE STANDBY NODES:** Start vault with
 
         systemctl start vault
         vault status
 
-12. Confirm that the version running is OSS via `vault status`.
+12. Confirm that the version running is OSS via `vault status`. The version should _**NOT**_ include `ent` in the name, and the rest of the `vault status` output should look healthy (similar to how it looked at the beginning of this process).
 13. On any node or endpoint, log into vault and confirm the cluster members with the operator command:
 
         vault operator raft list-peers
 
-14. The migration is nearly complete. Unlock the autoscaling group in AWS by removing the suspended processes. Update the terraform to match your configs (below) and run `terraform apply`. This will update the `user_data` in the launch template and roll the nodes, so that any future updates or node replacement will function properly and use the OSS binary without a `license_path` parameter:
+14. The migration is nearly complete. Unlock the autoscaling group in AWS by removing the suspended processes. Update the terraform to use the OSS binary (remove the +ent from the version) and run `terraform apply`. This will update the `user_data` in the launch template and roll the nodes, so that any future updates or node replacement will function properly and use the OSS binary without a `license_path` parameter:
 
         vault_binary  = "vault"
         vault_version = "1.15.4-1" # or whatever version, was likely "1.15.4-1+ent" before this work
 
-15. **WARNING!!!** The user data changes we made above *SHOULD* configure Vault to take daily snapshots. However it is always a good idea to log into the Leader node after Terraform has rolled the nodes and Vault is healthy and run the backup script once manually to validate its functionality and confirm the script functions and all proper permissions are in place.
+15. **WARNING!!!** The user data changes made above *SHOULD* configure Vault to take daily snapshots. However it is always a good idea to log into the leader node after Terraform has rolled the nodes and Vault is healthy and run the backup script once manually to validate its functionality and confirm the script functions and all proper permissions are in place.
 
 Thats it--the cluster should now be running Vault OSS! Congratulations! You just saved 100s of 1000s of dollars per year.
 
@@ -337,7 +281,7 @@ Occasionally a failed leader election during this process can cause an issue lik
 If you are left with only standby nodes, make sure to NOT delete the nodes. It is possible that the data has not replicated between raft nodes, so deleting the wrong node may take the data with it. There are a few things to try before starting over from a snapshot:
 
 * Restart `vault` on each node, and wait a minute or two. Sometimes the leader election can take some time.
-* Validate the storage size, normally in /opt/vault/data/raft/raft.db. It will not necesarily be huge, but it should be at least a few MB, possibly much more depending on your Vault usage. If the storage size is not similar on all nodes in the cluster, find the biggest one, and make sure not to delete it, as it likely has the most up to date data.
-* Check the operator logs with `journalctl -u vault`. There may be helpful information
-* Attempt a [Lost Quorum Recovery](https://developer.hashicorp.com/vault/tutorials/raft/raft-lost-quorum). Start with all nodes in the cluster. If that fails, stop vault on the nodes that DO NOT have the largest raft.db. Follow the instructions for quorum recovery, but only on the one node, and with only one node config in the `raft.json` file. This will essentially tell vault to relaunch as a single-node cluster. You can then restart vault on the standby nodes and a leader election will likely occur.
+* Validate the storage size of the raft database, found in ${STORAGE_ROOT}/raft/raft.db. The storage root can be found in the `raft` section of your vault server config file. It will not necesarily be huge, but it should be at least a few MB, possibly much more depending on your Vault usage. If the storage size is not the same on all nodes in the cluster, find the biggest one, and make sure not to delete it, as it likely has the most up to date data.
+* Check the operator logs with `journalctl -u vault`. There may be helpful information. If nothing is obvious, you can try a quorum recovery.
+* Attempt a [Lost Quorum Recovery](https://developer.hashicorp.com/vault/tutorials/raft/raft-lost-quorum). Start with all nodes in the cluster. If that fails, stop vault on the nodes that DO NOT have the largest raft.db. Follow the instructions for quorum recovery, but only on the one node, and with only one node config in the `raft.json` file. This will essentially tell vault to relaunch as a single-node cluster. You can then restart vault on the standby nodes and a leader election will likely occur, bringing Vault back to a healthy state.
 
